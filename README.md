@@ -440,3 +440,102 @@ Contributions are welcome. Please:
 ## License
 
 [Apache-2.0](LICENSE)
+
+---
+
+## Multi-Bot & Orchestrator Extensions
+
+This fork adds three features for running Claude and Codex as distinct Telegram bot identities with automated debate/review loops.
+
+### Changes
+
+#### 1. Multi-Bot Support (`bridge.py`)
+
+Each actor can send messages via its own Telegram bot. Set `bot_token` in the actor entry inside `group.yaml`:
+
+```yaml
+actors:
+  - id: architect
+    title: Claude
+    bot_token: "<claude-bot-token>"
+  - id: reviewer
+    title: Codex
+    bot_token: "<codex-bot-token>"
+```
+
+The bridge reads each actor's token at startup and routes outbound messages through the matching bot. Group members see distinct avatars and names — no label prefixes needed.
+
+#### 2. Clean Message Format (`adapters/base.py`)
+
+Removed the `[actor → target]` prefix from outbound messages. With multi-bot, the bot's profile already identifies the speaker.
+
+#### 3. `@debate` / `@review` Trigger Routing (`bridge.py`)
+
+Plain group messages containing `@debate` or `@review` are forwarded into the ledger automatically, without requiring the `/send` prefix. This lets the orchestrator's watch mode pick them up from Telegram directly.
+
+### Orchestrator (`cccc_orchestrator.py`)
+
+A standalone script for automated multi-agent loops. Copy it into your project root.
+
+```bash
+# One-shot debate
+python3 cccc_orchestrator.py debate "REST vs GraphQL for mobile" --rounds 3
+
+# Code review loop: architect implements, reviewer approves, repeat until LGTM
+python3 cccc_orchestrator.py review "Implement JWT token validation" --rounds 5
+
+# Watch mode: auto-trigger from Telegram group messages
+python3 cccc_orchestrator.py watch --trigger "@debate"
+python3 cccc_orchestrator.py watch --trigger "@review" --review
+
+# Run in background
+nohup python3 cccc_orchestrator.py watch --trigger "@debate" > /tmp/orchestrator.log 2>&1 &
+```
+
+**Trigger syntax in group chat:**
+
+| Message | Effect |
+|---|---|
+| `@debate --rounds 2 question` | 2-round debate |
+| `@debate question 3轮` | 3-round debate (Chinese) |
+| `@debate question` | Default 3 rounds |
+
+The review loop stops early when the reviewer outputs `LGTM`, `approved`, or `✅`.
+
+### Operations Reference
+
+```bash
+# Reinstall after code changes (required for bridge changes to take effect)
+cd ~/projects/cccc
+pip install -e cccc-dev --quiet
+
+# Restart IM bridge
+cccc im stop && cccc im start
+
+# Check bridge logs
+tail -f ~/.cccc/groups/<group_id>/state/im_bridge.log
+
+# Check bridge process
+cccc im status
+
+# Restart orchestrator
+kill $(pgrep -f cccc_orchestrator) 2>/dev/null
+nohup python3 cccc_orchestrator.py watch --trigger "@debate" > /tmp/orchestrator.log 2>&1 &
+
+# Verify ledger is receiving messages
+tail -5 ~/.cccc/groups/<group_id>/ledger.jsonl | python3 -m json.tool
+
+# Check orchestrator is running and picking up triggers
+cat /tmp/orchestrator.log
+ps aux | grep orchestrator
+```
+
+### Troubleshooting
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `@debate` in group has no effect | bridge change not reinstalled | `pip install -e cccc-dev && cccc im stop && cccc im start` |
+| Orchestrator not triggering | Process crashed or syntax error | Check `cat /tmp/orchestrator.log`, restart |
+| Only one agent responds | Other agent's bot_token missing/wrong | Verify `bot_token` in `group.yaml` for each actor |
+| Messages still show `[actor]` prefix | Old bridge version running | Reinstall + restart bridge |
+| `cccc im start` returns `stopped: 0` | Bridge was already stopped | Normal, proceed |

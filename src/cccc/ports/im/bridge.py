@@ -300,6 +300,20 @@ class IMBridge:
         # to adapters instead of letting adapters guess from their own caches.
         self._mention_targets: Dict[str, List[str]] = {}
 
+        # Per-actor adapters for multi-bot support
+        self._actor_adapters: Dict[str, Any] = {}
+        if hasattr(adapter, "token"):
+            from cccc.ports.im.adapters.telegram import TelegramAdapter as _TA
+            for _actor in list_actors(group):
+                if not isinstance(_actor, dict): continue
+                _aid = str(_actor.get("id") or "").strip()
+                _atoken = str(_actor.get("bot_token") or "").strip()
+                if _aid and _atoken and _atoken != adapter.token:
+                    self._actor_adapters[_aid] = _TA(token=_atoken, log_path=log_path)
+
+    def _get_actor_adapter(self, actor_id: str):
+        return self._actor_adapters.get(str(actor_id or "").strip(), self.adapter)
+
     def _should_process_inbound(self, *, chat_id: str, thread_id: int, message_id: str) -> bool:
         """
         Return True if this inbound message should be processed.
@@ -526,6 +540,29 @@ class IMBridge:
                 if text.lstrip().startswith("/"):
                     if routed or chat_type in ("private",):
                         self.adapter.send_message(chat_id, "❓ Unknown command. Use /help.", thread_id=thread_id)
+                    continue
+
+                # Auto-forward @debate / @review triggers from mirror chat to ledger.
+                _trigger_keywords = ("@debate", "@review")
+                if any(kw in text for kw in _trigger_keywords):
+                    attachments = msg.get("attachments") if isinstance(msg.get("attachments"), list) else []
+                    implicit_args = parsed.text.split() if parsed.text else []
+                    implicit_send = ParsedCommand(
+                        type=CommandType.SEND,
+                        text=parsed.text,
+                        mentions=parsed.mentions,
+                        args=implicit_args,
+                    )
+                    self._handle_message(
+                        chat_id,
+                        implicit_send,
+                        from_user,
+                        attachments=attachments,
+                        mention_user_ids=[],
+                        thread_id=thread_id,
+                        message_id=message_id,
+                        from_user_id=from_user_id,
+                    )
                     continue
 
                 # When routed (@bot or DM), treat plain text as implicit /send.
@@ -881,7 +918,7 @@ class IMBridge:
                     ok = False
                     try:
                         ok = bool(
-                            self.adapter.send_file(
+                            self._get_actor_adapter(by).send_file(
                                 sub.chat_id,
                                 file_path=abs_path,
                                 filename=title,
@@ -900,10 +937,10 @@ class IMBridge:
             # If we didn't send any files, or if there's text with no files, send message.
             if formatted and not sent_any_file and not skip_text_due_to_stream:
                 if mention_user_ids is None:
-                    sent_msg = bool(self.adapter.send_message(sub.chat_id, formatted, thread_id=sub.thread_id))
+                    sent_msg = bool(self._get_actor_adapter(by).send_message(sub.chat_id, formatted, thread_id=sub.thread_id))
                 else:
                     sent_msg = bool(
-                        self.adapter.send_message(
+                        self._get_actor_adapter(by).send_message(
                             sub.chat_id,
                             formatted,
                             thread_id=sub.thread_id,

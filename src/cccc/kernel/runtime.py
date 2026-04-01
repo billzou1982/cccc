@@ -212,7 +212,7 @@ def get_runtime_command_with_flags(name: str) -> List[str]:
         "claude": ["claude", "--dangerously-skip-permissions"],
         # Codex spawns MCP servers as subprocesses; ensure it inherits actor env (CCCC_GROUP_ID/CCCC_ACTOR_ID)
         # so MCP tools can resolve "self" context reliably.
-        "codex": ["codex", "-c", "shell_environment_policy.inherit=all", "--dangerously-bypass-approvals-and-sandbox", "--search"],
+        "codex": ["codex", "-c", "shell_environment_policy.inherit=all", "--dangerously-bypass-approvals-and-sandbox"],
         "droid": ["droid", "--auto", "high"],
         "gemini": ["gemini", "--yolo"],
         "kimi": ["kimi", "--yolo"],

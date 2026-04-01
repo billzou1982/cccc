@@ -115,12 +115,11 @@ class IMAdapter(ABC):
             return f"[SYSTEM] {text}"
 
         if to and "user" not in to:
-            # Agent to agent message
-            to_str = ", ".join(to)
-            return f"[{by} → {to_str}] {text}"
+            # Agent to agent message (multi-bot: identity shown via bot avatar)
+            return text
         else:
             # Agent to user message
-            return f"[{by}] {text}"
+            return text
 
     def send_chat_action(self, chat_id: str, action: str = "typing") -> bool:
         """Send a chat action indicator. Default: no-op."""
