@@ -16,6 +16,7 @@ import os
 import re
 import signal
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -242,6 +243,129 @@ class LedgerWatcher:
         return events
 
 
+class DebateManager:
+    """
+    Manages @debate sessions triggered from the IM mirror chat.
+    Runs in a background thread: sends the question to both actors,
+    waits for both to reply each round, then posts results back to the
+    mirror chat in order (architect first, then reviewer).
+    """
+
+    def __init__(self, bridge: "IMBridge", question: str, rounds: int,
+                 reply_chat_id: str, reply_thread_id: int = 0,
+                 architect_id: str = "architect", reviewer_id: str = "reviewer") -> None:
+        self.bridge = bridge
+        self.question = question
+        self.rounds = rounds
+        self.reply_chat_id = reply_chat_id
+        self.reply_thread_id = reply_thread_id
+        self.architect_id = architect_id
+        self.reviewer_id = reviewer_id
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def _send_actor(self, text: str, to: str) -> None:
+        """Send a message to an actor via daemon."""
+        result = self.bridge._daemon({
+            "op": "send",
+            "args": {
+                "group_id": self.bridge.group.group_id,
+                "text": text,
+                "to": [to],
+                "by": "user",
+            },
+        })
+        if not result.get("ok"):
+            self.bridge._log(f"[debate] send_actor to={to} error={result.get('error')}")
+
+    def _wait_both(self, ledger_path: Path, timeout: int = 300, offset: int = 0) -> tuple:
+        """Tail ledger until both architect and reviewer have replied."""
+        results: Dict[str, str] = {}
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                with open(ledger_path, "r", encoding="utf-8", errors="replace") as f:
+                    f.seek(offset)
+                    chunk = f.read()
+                    offset = f.tell()
+                for line in chunk.splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        ev = json.loads(line)
+                    except Exception:
+                        continue
+                    if ev.get("kind") != "chat.message":
+                        continue
+                    by = ev.get("by", "")
+                    text = (ev.get("data") or {}).get("text", "") or ""
+                    if by == self.architect_id and self.architect_id not in results and text:
+                        results[self.architect_id] = text
+                    elif by == self.reviewer_id and self.reviewer_id not in results and text:
+                        results[self.reviewer_id] = text
+                    if self.architect_id in results and self.reviewer_id in results:
+                        return results.get(self.architect_id), results.get(self.reviewer_id)
+            except Exception:
+                pass
+            time.sleep(1)
+        return results.get(self.architect_id), results.get(self.reviewer_id)
+
+    def _mirror(self, text: str) -> None:
+        """Send text directly back to the mirror chat."""
+        try:
+            self.bridge.adapter.send_message(
+                self.reply_chat_id, text, thread_id=self.reply_thread_id
+            )
+        except Exception as e:
+            self.bridge._log(f"[debate] mirror error: {e}")
+
+    def _run(self) -> None:
+        group = self.bridge.group
+        ledger_path = group.ledger_path
+        q = self.question
+
+        self.bridge._log(f"[debate] starting '{q[:60]}' rounds={self.rounds}")
+
+        # Record ledger offset BEFORE sending so we don't miss fast responses
+        try:
+            start_offset = ledger_path.stat().st_size
+        except Exception:
+            start_offset = 0
+
+        # Round 1: send question to both actors simultaneously
+        self._send_actor(q, self.architect_id)
+        self._send_actor(q, self.reviewer_id)
+
+        for round_n in range(1, self.rounds + 1):
+            self.bridge._log(f"[debate] waiting round {round_n}")
+            arch_text, rev_text = self._wait_both(ledger_path, offset=start_offset)
+            if not arch_text or not rev_text:
+                self._mirror("⏱ Debate timed out waiting for responses.")
+                self.bridge._log("[debate] timeout")
+                return
+
+            # Post results in order
+            self._mirror(f"🔵 Claude（Round {round_n}）：\n{arch_text}")
+            time.sleep(0.5)
+            self._mirror(f"🟠 Codex（Round {round_n}）：\n{rev_text}")
+
+            if round_n == self.rounds:
+                break
+
+            nl = "\n"
+            try:
+                start_offset = ledger_path.stat().st_size
+            except Exception:
+                pass
+            self._send_actor(f"Codex的观点：{nl}{rev_text}{nl}{nl}请回应并进一步阐述你的立场。", self.architect_id)
+            self._send_actor(f"Claude的观点：{nl}{arch_text}{nl}{nl}请回应并进一步阐述你的立场。", self.reviewer_id)
+
+        self.bridge._log("[debate] done")
+
+
 class IMBridge:
     """
     Main IM Bridge class.
@@ -299,6 +423,9 @@ class IMBridge:
         # The bridge computes this from inbound metadata and passes it explicitly
         # to adapters instead of letting adapters guess from their own caches.
         self._mention_targets: Dict[str, List[str]] = {}
+
+        # Debate concurrency lock: only one @debate session at a time
+        self._debate_lock = threading.Lock()
 
         # Per-actor adapters for multi-bot support
         self._actor_adapters: Dict[str, Any] = {}
@@ -542,27 +669,45 @@ class IMBridge:
                         self.adapter.send_message(chat_id, "❓ Unknown command. Use /help.", thread_id=thread_id)
                     continue
 
-                # Auto-forward @debate / @review triggers from mirror chat to ledger.
-                _trigger_keywords = ("@debate", "@review")
-                if any(kw in text for kw in _trigger_keywords):
-                    attachments = msg.get("attachments") if isinstance(msg.get("attachments"), list) else []
-                    implicit_args = parsed.text.split() if parsed.text else []
-                    implicit_send = ParsedCommand(
-                        type=CommandType.SEND,
-                        text=parsed.text,
-                        mentions=parsed.mentions,
-                        args=implicit_args,
-                    )
-                    self._handle_message(
-                        chat_id,
-                        implicit_send,
-                        from_user,
-                        attachments=attachments,
-                        mention_user_ids=[],
-                        thread_id=thread_id,
-                        message_id=message_id,
-                        from_user_id=from_user_id,
-                    )
+                # @debate bypass — intercept and run debate in background thread
+                if "@debate" in text:
+                    # Filter out Telegram forwarded message pollution (e.g. "Name, [date]:\n\n  question")
+                    debate_raw = text.replace("@debate", "").strip()
+                    # Strip Telegram forward headers: "Name, [Apr 1, 2026 at ...]:" pattern
+                    debate_raw = re.sub(r'^[^:\n]{1,80},\s*\[[^\]]+\]:\s*', '', debate_raw, flags=re.MULTILINE).strip()
+                    debate_question = debate_raw
+                    debate_rounds = 2
+                    m_rounds = re.search(r"(\d+)\s*(?:轮|rounds?)", debate_question, re.IGNORECASE)
+                    if m_rounds:
+                        debate_rounds = int(m_rounds.group(1))
+                        debate_question = (debate_question[:m_rounds.start()] + debate_question[m_rounds.end():]).strip()
+                    else:
+                        m_rounds2 = re.search(r"--rounds\s+(\d+)", debate_question)
+                        if m_rounds2:
+                            debate_rounds = int(m_rounds2.group(1))
+                            debate_question = (debate_question[:m_rounds2.start()] + debate_question[m_rounds2.end():]).strip()
+                    if not debate_question:
+                        self.adapter.send_message(chat_id, "❓ @debate 后面需要问题，例如：@debate 日内交易值得做吗？ 2轮", thread_id=thread_id)
+                        continue
+                    if not self._debate_lock.acquire(blocking=False):
+                        self.adapter.send_message(chat_id, "⏳ 已有辩论进行中，请等待结束后再发起新辩论。", thread_id=thread_id)
+                        continue
+                    # Resolve actor ids dynamically from group config
+                    group_doc = load_group(self.group.group_id)
+                    actors = list_actors(group_doc) if group_doc else []
+                    actor_ids = [str(a.get("id") or "").strip() for a in actors if isinstance(a, dict)]
+                    architect_id = actor_ids[0] if len(actor_ids) > 0 else "architect"
+                    reviewer_id = actor_ids[1] if len(actor_ids) > 1 else "reviewer"
+                    self._log(f"[debate] triggered '{debate_question[:60]}' rounds={debate_rounds} arch={architect_id} rev={reviewer_id}")
+                    def _run_debate(lock=self._debate_lock, q=debate_question, r=debate_rounds,
+                                    cid=chat_id, tid=thread_id, aid=architect_id, rid=reviewer_id):
+                        try:
+                            dm = DebateManager(self, q, r, cid, tid, architect_id=aid, reviewer_id=rid)
+                            dm._run()
+                        finally:
+                            lock.release()
+                    t = threading.Thread(target=_run_debate, daemon=True)
+                    t.start()
                     continue
 
                 # When routed (@bot or DM), treat plain text as implicit /send.
@@ -973,8 +1118,9 @@ class IMBridge:
             if verbose:
                 return True
 
-            # Non-verbose: only forward to:user messages
-            if "user" in to or not to:
+            # Non-verbose: only forward messages sent by "user" (orchestrator/human)
+            # Agent messages (architect/reviewer) are handled by orchestrator directly.
+            if by == "user" and ("user" in to or not to):
                 return True
 
             return False
