@@ -259,11 +259,13 @@ class IMBridge:
         adapter: IMAdapter,
         log_path: Optional[Path] = None,
         skip_pending_on_start: bool = False,
+        im_config: Optional[Dict[str, Any]] = None,
     ):
         self.group = group
         self.adapter = adapter
         self.log_path = log_path
         self.skip_pending_on_start = skip_pending_on_start
+        self._im_config: Dict[str, Any] = im_config or {}
 
         self.subscribers = SubscriberManager(group.path / "state")
         self.key_manager = KeyManager(group.path / "state")
@@ -357,9 +359,40 @@ class IMBridge:
             else:
                 self._log("[start] Warning: failed to skip pending messages")
 
+        # Auto-authorize and subscribe the mirror chat if configured.
+        # This allows pre-configured chats to receive outbound messages
+        # without requiring a manual /subscribe + bind flow.
+        self._setup_mirror_chat()
+
         self._running = True
         self._log(f"[start] Bridge started for group {self.group.group_id}")
         return True
+
+    def _setup_mirror_chat(self) -> None:
+        """Auto-authorize and subscribe the mirror_chat_id from IM config (if set)."""
+        mirror_chat_id = str(self._im_config.get("mirror_chat_id") or "").strip()
+        if not mirror_chat_id:
+            return
+        try:
+            mirror_thread_id = int(self._im_config.get("mirror_thread_id") or 0)
+        except Exception:
+            mirror_thread_id = 0
+
+        platform = str(getattr(self.adapter, "platform", "") or "").strip().lower()
+
+        # Authorize (idempotent: re-authorizing an already-authorized chat is a no-op)
+        self.key_manager.authorize(mirror_chat_id, mirror_thread_id, platform, key_used="mirror")
+        # Subscribe (idempotent)
+        self.subscribers.subscribe(
+            mirror_chat_id,
+            chat_title="mirror",
+            thread_id=mirror_thread_id,
+            platform=platform,
+        )
+        self._log(
+            f"[mirror] Auto-authorized and subscribed mirror chat: "
+            f"chat_id={mirror_chat_id} thread_id={mirror_thread_id}"
+        )
 
     def stop(self) -> None:
         """Stop the bridge."""
@@ -1606,6 +1639,7 @@ def start_bridge(group_id: str, platform: str = "telegram") -> None:
         adapter=adapter,
         log_path=log_path,
         skip_pending_on_start=skip_pending,
+        im_config=im_config,
     )
 
     # Setup signal handlers

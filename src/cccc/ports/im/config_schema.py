@@ -102,6 +102,18 @@ def canonicalize_im_config(raw: Any) -> Dict[str, Any]:
     if "skip_pending_on_start" in raw:
         out["skip_pending_on_start"] = coerce_bool(raw.get("skip_pending_on_start"), default=True)
 
+    # Outbound mirror: pre-authorized chat that automatically receives all
+    # agent messages without requiring a manual /subscribe + bind flow.
+    mirror_chat_id = str(raw.get("mirror_chat_id") or "").strip()
+    if mirror_chat_id:
+        out["mirror_chat_id"] = mirror_chat_id
+        try:
+            mirror_thread_id = int(raw.get("mirror_thread_id") or 0)
+        except Exception:
+            mirror_thread_id = 0
+        if mirror_thread_id:
+            out["mirror_thread_id"] = mirror_thread_id
+
     if platform in {"telegram", "discord", "slack"}:
         bot_ref = _first_nonempty(raw, "bot_token_env", "bot_token", "token_env", "token")
         _set_secret_ref(out, env_key="bot_token_env", value_key="bot_token", raw_value=bot_ref)
@@ -163,7 +175,8 @@ def canonicalize_im_config(raw: Any) -> Dict[str, Any]:
             continue
         if key in _LEGACY_KEYS:
             continue
-        if key in {"platform", "enabled", "files", "skip_pending_on_start", "wecom_agent_id"}:
+        if key in {"platform", "enabled", "files", "skip_pending_on_start", "wecom_agent_id",
+                   "mirror_chat_id", "mirror_thread_id"}:
             continue
         out[key] = value
 
